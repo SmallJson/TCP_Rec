@@ -25,7 +25,9 @@ public class TCPReceiveClient {
             return o1.seq-o2.seq;
         }
     });
-
+    /**
+     * 以下四个是调试程序时的统计量信息
+     */
     //发送出去的ACK报文数量
     public static volatile int ackCount = 0;
     //加入阻塞队列的Ack报文数量
@@ -34,11 +36,20 @@ public class TCPReceiveClient {
     public  static  volatile int ackQueue = 0;
     //收到的数据报文的数量
     public static volatile int recTotal = 0;
-    //接收端报文队列的缓存大小
-    volatile int cacheSize = 5;
 
-    //采用延迟确认的策略
-    public long time = 500L;
+    /**
+     * 接收端延迟确认的策略:
+     * 定时时间到，不管是否超过缓冲阈值，发送ACK报文，并且清空缓冲区计数
+     * 超过缓冲阈值，不管是否定时时间到，发送ACK报文，并且让定时时间失效
+     */
+    //1.定时发送ACK报文时间间隔
+    public long time = 1000L;
+    //2.接收端缓冲报文阈值，超过该阈值则发送ack报文
+    public int cacheSize = 20;
+    //当前缓冲的ACK报文大小
+    public int existPacketSize = 0;
+    //清空定时时间的标准
+    public boolean ackFlag =false;
 
     //存储ack数据包的延迟队列
     DelayQueue<Packet> delayQueue = new DelayQueue<>();
@@ -54,10 +65,10 @@ public class TCPReceiveClient {
     }
 
     public void init(){
-        initServerSocket();
-        initThread();
         //序列为0的ack报文垫底
         cachePacktet.add(new Packet(true,0,0L, Contans.returnLinkDelay));
+        initServerSocket();
+        initThread();
         loopDelayQueue();
     }
     private void initServerSocket(){
@@ -79,7 +90,7 @@ public class TCPReceiveClient {
             }
         }).start();
 
-        //开启一个定时报告ACK信息的调度任务
+        //开启一个定时报告统计信息的调度任务
         new Timer().schedule(new TimerTask() {
             @Override
             public void run() {
@@ -88,6 +99,22 @@ public class TCPReceiveClient {
                         +",fisrtSkipNum="+getSkipNum()+",lastNum="+cachePacktet.last().seq);
             }
         },30000L,5000L);
+
+        //开启一个ACK反馈机制
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                if(ackFlag){
+                    //定时时间到，但是已经触发缓冲区溢出的条件，不做定时反馈
+                    ackFlag = false;
+                }else{
+                    //没有触发缓冲区溢出条件，所以做定时反馈
+                    if(cachePacktet.last().seq !=0)
+                        arrivePacket(null);
+                    existPacketSize = 0;
+                }
+            }
+        },0L,time);
     }
 
     //从延迟队列不间断拿包发送
@@ -131,18 +158,34 @@ public class TCPReceiveClient {
         //相同数据报文在丢弃，不同数据报文加入
         if (packet !=null && !cachePacktet.contains(packet)){
             cachePacktet.add(packet);
+            //新来的报文，缓冲计数+1
+            existPacketSize++;
         }
-        ArrayList<Integer> seqList = new ArrayList<Integer>();
+        if(packet != null && existPacketSize < 20){
+            //缓冲区未溢出不发送ACK报文
+            return ;
+        }
 
-        //int [] seqNum = new int [cachePacktet.size()];
+        if(packet != null){
+            //缓冲区溢出发送ACK报文,设置标志位
+            ackFlag = true;
+            existPacketSize = 0;
+        }
+
         //获取第一个不连续点
-        int ackNum = getSkipNum();
-        //ack报文入队
+        Packet dataPacket = getSkipPacket();
+
+        //ack报文
         Packet ackPacket = null;
-        if(packet != null)
-            ackPacket =new Packet(false,ackNum,packet.startTime,System.currentTimeMillis(), Contans.returnLinkDelay);
-        else
-            ackPacket =new Packet(false,ackNum,null,System.currentTimeMillis(), Contans.returnLinkDelay);
+        if(packet != null){
+            //缓冲区溢出报告ACK报文
+            ackPacket =new Packet(false,dataPacket.seq,packet.startTime,System.currentTimeMillis(), Contans.returnLinkDelay);
+        }
+        else{
+            //定时时间到报告ACK报文
+            ackPacket =new Packet(false,dataPacket.seq,dataPacket.startTime,System.currentTimeMillis(), Contans.returnLinkDelay);
+        }
+
         int preCount = delayQueue.size();
         delayQueue.put(ackPacket);
         int newCount = delayQueue.size();
@@ -157,7 +200,7 @@ public class TCPReceiveClient {
 
     //找到缓存报文中第一个不连续点
     public int getSkipNum(){
-        ArrayList<Integer> seqList = new ArrayList<Integer>();
+       ArrayList<Integer> seqList = new ArrayList<Integer>();
 
         //int [] seqNum = new int [cachePacktet.size()];
         int ackNum = cachePacktet.last().seq;
@@ -176,6 +219,29 @@ public class TCPReceiveClient {
         return ackNum;
     }
 
+    /**
+     * 或许第一个序号不连续的报文
+     * @return
+     */
+    public Packet getSkipPacket(){
+        ArrayList<Packet> seqList = new ArrayList<Packet>();
+
+        //int [] seqNum = new int [cachePacktet.size()];
+        Packet ackPacket = cachePacktet.last();
+        int i = 0;
+        for(Packet pk : cachePacktet){
+            seqList.add(pk);
+        }
+        //System.out.println(seqNum);
+        for(int index = 0; index < seqList.size()-1;index++){
+            if(seqList.get(index).seq != seqList.get(index+1).seq -1){
+                //找到第一个不连续点
+                ackPacket = seqList.get(index);
+                break;
+            }
+        }
+        return ackPacket;
+    }
     private  void sendAck(Packet packet){
             //sendClient.recACK(packet);
            SocketUtil.sendPacketToRouter(packet);
